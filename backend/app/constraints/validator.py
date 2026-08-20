@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from sqlalchemy.orm import Session
-
 from app.constraints.schemas import GeneratedConstraint
 from app.constraints.resolver import (
     EntityResolutionError,
     resolve_teacher,
-    resolve_subject,
+    resolve_subject_candidates,
     resolve_class,
     resolve_room,
     resolve_day_slots,
     resolve_slot,
     resolve_period,
+    parse_slot_value,
 )
+from app.models.models import Room, Subject
 
 
 class ConstraintValidationError(Exception):
@@ -20,208 +20,142 @@ class ConstraintValidationError(Exception):
     pass
 
 
-def validate_constraint(
-    db: Session,
-    constraint: GeneratedConstraint,
-) -> bool:
-    """
-    Validate that all entities referenced by the generated
-    constraint actually exist in the timetable database.
-
-    The LLM generates the constraint.
-    This function deterministically verifies that the
-    referenced timetable entities are valid.
-
-    Returns:
-        True if the constraint is valid.
-
-    Raises:
-        EntityResolutionError:
-            If any referenced entity does not exist.
-    """
-
+def validate_constraint(db, constraint: GeneratedConstraint) -> bool:
     _validate_expression(db, constraint.expression)
-
     return True
 
 
-def _validate_expression(db: Session, expression):
-    """
-    Recursively validate every expression inside a constraint.
-    """
-
+def _validate_expression(db, expression):
     kind = expression.kind
-
-    # --------------------------------------------------------
-    # Comparison
-    # --------------------------------------------------------
-
     if kind == "comparison":
-
         _validate_numeric_expression(db, expression.left)
         _validate_numeric_expression(db, expression.right)
-
         return
-
-    # --------------------------------------------------------
-    # Forbid
-    # --------------------------------------------------------
-
-    if kind == "forbid":
-
+    if kind in ("forbid", "exists", "no_adjacent"):
         _validate_condition(db, expression.filter)
-
         return
-
-    # --------------------------------------------------------
-    # Exists
-    # --------------------------------------------------------
-
-    if kind == "exists":
-
-        _validate_condition(db, expression.filter)
-
-        return
-
-    # --------------------------------------------------------
-    # No Adjacent
-    # --------------------------------------------------------
-
-    if kind == "no_adjacent":
-
-        _validate_condition(db, expression.filter)
-
-        return
-
-    # --------------------------------------------------------
-    # For Each
-    # --------------------------------------------------------
-
     if kind == "for_each":
-
         _validate_expression(db, expression.expression)
-
         return
-
-    raise ConstraintValidationError(
-        f"Unsupported expression type: {kind}"
-    )
+    raise ConstraintValidationError(f"Unsupported expression type: {kind}")
 
 
-def _validate_numeric_expression(db: Session, expression):
-
-    kind = expression.kind
-
-    if kind == "constant":
+def _validate_numeric_expression(db, expression):
+    if expression.kind == "constant":
         return
-
-    if kind == "count":
-
+    if expression.kind == "count":
         _validate_condition(db, expression.filter)
-
         return
-
-    raise ConstraintValidationError(
-        f"Unsupported numeric expression: {kind}"
-    )
+    raise ConstraintValidationError(f"Unsupported numeric expression: {expression.kind}")
 
 
-def _validate_condition(db: Session, condition):
-
+def _validate_condition(db, condition, context: dict | None = None):
+    """Validate conditions while carrying class/type scope into subjects."""
+    context = dict(context or {})
     kind = condition.kind
 
-    # --------------------------------------------------------
-    # Atomic condition
-    # --------------------------------------------------------
-
     if kind == "atomic":
-
-        _validate_atomic_condition(db, condition)
-
+        _validate_atomic_condition(db, condition, context=context)
         return
-
-    # --------------------------------------------------------
-    # AND
-    # --------------------------------------------------------
 
     if kind == "and":
+        local_context = dict(context)
+        for child in condition.conditions:
+            if child.kind == "atomic" and child.operator == "eq" and child.field in {"class", "subject_type"}:
+                local_context[child.field] = child.value
 
         for child in condition.conditions:
-            _validate_condition(db, child)
-
+            _validate_condition(db, child, context=local_context)
         return
-
-    # --------------------------------------------------------
-    # OR
-    # --------------------------------------------------------
 
     if kind == "or":
-
         for child in condition.conditions:
-            _validate_condition(db, child)
-
+            _validate_condition(db, child, context=context)
         return
-
-    # --------------------------------------------------------
-    # NOT
-    # --------------------------------------------------------
 
     if kind == "not":
-
-        _validate_condition(db, condition.condition)
-
+        _validate_condition(db, condition.condition, context=context)
         return
 
-    raise ConstraintValidationError(
-        f"Unsupported condition type: {kind}"
-    )
+    raise ConstraintValidationError(f"Unsupported condition type: {kind}")
 
 
-def _validate_atomic_condition(
-    db: Session,
-    condition: AtomicCondition,
-) -> None:
-    """
-    Validate the entity/value referenced by an atomic condition.
-
-    Entity validation is delegated to resolver.py so that the
-    database remains the source of truth.
-    """
-
+def _validate_atomic_condition(db, condition, *, context: dict | None = None) -> None:
     field = condition.field
     value = condition.value
+    context = context or {}
 
     if field == "teacher":
         resolve_teacher(db, str(value))
-
     elif field == "subject":
-        resolve_subject(db, str(value))
-
+        _resolve_subject_in_context(db, str(value), context)
     elif field == "class":
         resolve_class(db, str(value))
-
     elif field == "room":
         resolve_room(db, str(value))
-
     elif field == "day":
         resolve_day_slots(db, str(value))
-
     elif field == "period":
-        if not isinstance(value, int):
-            raise EntityResolutionError(
-                f"Period '{value}' must be an integer."
-            )
-
-        resolve_period(db, value)
-
+        if isinstance(value, bool):
+            raise EntityResolutionError(f"Period '{value}' must be an integer.")
+        try:
+            period = int(value)
+        except (TypeError, ValueError) as exc:
+            raise EntityResolutionError(f"Period '{value}' must be an integer.") from exc
+        resolve_period(db, period)
     elif field == "slot":
-        # Slot validation is handled separately because a slot
-        # requires both day and period information.
+        day, period = parse_slot_value(value)
+        resolve_slot(db, day, period)
+    elif field == "room_type":
+        requested = str(value).strip().lower()
+        available = {
+            str(room.room_type).strip().lower()
+            for room in db.query(Room).all()
+            if room.room_type is not None
+        }
+        if requested not in available:
+            raise EntityResolutionError(f"Room type '{value}' was not found.")
+    elif field == "subject_type":
+        requested = str(value).strip().lower()
+        available = {
+            str(subject.subject_type).strip().lower()
+            for subject in db.query(Subject).all()
+            if subject.subject_type is not None
+        }
+        if requested not in available:
+            raise EntityResolutionError(f"Subject type '{value}' was not found.")
+    else:
+        raise ConstraintValidationError(f"Unsupported condition field: {field}")
+
+
+def _resolve_subject_in_context(db, name: str, context: dict) -> None:
+    """Resolve a subject, optionally narrowed by class and subject type."""
+    candidates = resolve_subject_candidates(db, name)
+    if len(candidates) <= 1:
+        return
+
+    class_value = context.get("class")
+    if class_value is not None:
+        class_entity = resolve_class(db, str(class_value))
+        candidates = [
+            subject for subject in candidates
+            if subject.class_id == class_entity.class_id
+        ]
+
+    subject_type = context.get("subject_type")
+    if subject_type is not None:
+        requested = str(subject_type).strip().lower()
+        candidates = [
+            subject for subject in candidates
+            if str(subject.subject_type or "theory").strip().lower() == requested
+        ]
+
+    if len(candidates) == 1:
+        return
+    if not candidates:
         raise EntityResolutionError(
-            "Direct slot validation is not supported yet."
+            f"Subject '{name}' does not have a registration matching the selected class/type."
         )
 
-    elif field in ("room_type", "subject_type"):
-        # These are categorical attributes rather than entities.
-        # They don't need database entity resolution at this stage.
-        return
+    names = ", ".join(str(getattr(subject, "subject_name", name)) for subject in candidates[:5])
+    raise EntityResolutionError(f"Multiple subjects matched '{name}': {names}.")

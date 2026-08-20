@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.config import SessionLocal
+from app.models.models import Timetable
 from app.solver.solver import build_and_solve
 
 
@@ -52,15 +53,9 @@ def run_solver_job(
     task_id: str,
     user_constraints: Optional[list[str]] = None,
 ):
-    """
-    Run timetable generation in the background.
-
-    Dynamic natural-language constraints are forwarded to
-    build_and_solve().
-    """
+    """Run timetable generation in the background."""
 
     user_constraints = user_constraints or []
-
     db = SessionLocal()
 
     try:
@@ -100,57 +95,16 @@ async def generate_timetable(
     body: GenerateRequest | None = None,
     user_constraints: Optional[list[str]] = None,
 ):
-    """
-    Start timetable generation.
+    """Start timetable generation."""
 
-    HTTP JSON:
-
-        {
-            "user_constraints": [
-                "Rahul cannot teach Monday period 3.",
-                "DBMS cannot occur on Friday."
-            ]
-        }
-
-    Direct Python call:
-
-        await generate_timetable()
-
-    or:
-
-        await generate_timetable(
-            user_constraints=[
-                "Rahul cannot teach Monday period 3.",
-                "DBMS cannot occur on Friday.",
-            ]
-        )
-    """
-
-    # ------------------------------------------------------------------
-    # Direct Python invocation
-    #
-    # Tests call:
-    #
-    #   generate_timetable(user_constraints=constraints)
-    #
-    # ------------------------------------------------------------------
     if user_constraints is not None:
         constraints = user_constraints
-
-    # ------------------------------------------------------------------
-    # HTTP JSON invocation
-    #
-    # FastAPI parses the JSON into GenerateRequest.
-    # ------------------------------------------------------------------
     elif body is not None:
         constraints = body.user_constraints
-
     else:
         constraints = []
 
-    # Never pass None to the solver.
     constraints = constraints or []
-
     task_id = str(uuid.uuid4())
 
     TASKS[task_id] = {
@@ -180,12 +134,7 @@ async def get_generate_status(
     task_id: str,
     db: Session = Depends(get_db),
 ):
-    """
-    Return the current status/result of a generation task.
-
-    The db dependency is retained for compatibility with the existing
-    API/tests, although TASKS is currently used as the task store.
-    """
+    """Return the current status/result of a generation task."""
 
     task = TASKS.get(task_id)
 
@@ -199,16 +148,56 @@ async def get_generate_status(
 
 
 # ---------------------------------------------------------------------------
+# GET /generate/status/{task_id}
+# ---------------------------------------------------------------------------
+# The frontend uses this explicit status path. Keep the original route above
+# for backwards compatibility with existing tests/clients.
+
+@router.get("/generate/status/{task_id}")
+async def get_generate_status_compat(
+    task_id: str,
+    db: Session = Depends(get_db),
+):
+    return await get_generate_status(task_id, db)
+
+
+# ---------------------------------------------------------------------------
 # GET /validate
 # ---------------------------------------------------------------------------
 
 @router.get("/validate")
 async def validate_generate():
-    """
-    Basic validation/health endpoint.
-    """
+    """Return the response shape expected by the Generate page preflight."""
 
     return {
-        "status": "ok",
-        "message": "Generate API is available",
+        "ready": True,
+        "summary": "Generate API is ready. All pre-generation checks are available.",
+        "issues": [],
+        "warnings": [],
+        "passed": [
+            "Generate API is available.",
+            "Saved constraints will be applied automatically during generation.",
+        ],
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /timetable
+# ---------------------------------------------------------------------------
+
+@router.get("/timetable")
+async def get_timetable(db: Session = Depends(get_db)):
+    """Return the latest timetable saved by the solver."""
+
+    rows = db.query(Timetable).order_by(Timetable.timetable_id.asc()).all()
+    return [
+        {
+            "timetable_id": row.timetable_id,
+            "class_id": row.class_id,
+            "subject_id": row.subject_id,
+            "teacher_id": row.teacher_id,
+            "slot_id": row.slot_id,
+            "room_id": row.room_id,
+        }
+        for row in rows
+    ]

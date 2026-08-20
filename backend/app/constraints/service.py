@@ -10,58 +10,26 @@ from app.constraints.schemas import GeneratedConstraint
 
 
 class ConstraintService:
-
     def __init__(self):
         self.generator = ConstraintGenerator()
 
-    def generate_and_validate(
-        self,
-        db: Session,
-        user_text: str,
-    ) -> GeneratedConstraint:
-        """
-        Convert natural-language user input into a
-        validated structured constraint.
-
-        Pipeline:
-
-            Natural language
-                    ↓
-                 Gemini
-                    ↓
-          GeneratedConstraint
-                    ↓
-          Entity validation
-        """
-
-        constraint = self.generator.generate(
-            user_text
-        )
-
-        validate_constraint(
-            db,
-            constraint,
-        )
-
+    def generate_and_validate(self, db: Session, user_text: str) -> GeneratedConstraint:
+        constraint = self.generator.generate(user_text)
+        validate_constraint(db, constraint)
         return constraint
 
-    def compile(
-        self,
-        model: cp_model.CpModel,
-        assign: dict,
-        constraint: GeneratedConstraint,
-        data: dict,
-    ) -> list:
-        """
-        Compile a validated constraint into CP-SAT.
-        """
-
-        return compile_constraint(
+    def compile(self, model: cp_model.CpModel, assign: dict, constraint: GeneratedConstraint, data: dict) -> list:
+        penalties = compile_constraint(
             model=model,
             assign=assign,
             constraint=constraint,
             data=data,
         )
+        # The compiler produces a unit violation penalty. Apply the declared
+        # soft-constraint weight here so the objective respects user intent.
+        if constraint.constraint_type == "soft" and constraint.weight not in (None, 1):
+            return [penalty * constraint.weight for penalty in penalties]
+        return penalties
 
     def generate_validate_and_compile(
         self,
@@ -71,30 +39,11 @@ class ConstraintService:
         data: dict,
         user_text: str,
     ) -> tuple[GeneratedConstraint, list]:
-        """
-        Complete constraint pipeline:
-
-            User text
-                 ↓
-              Gemini
-                 ↓
-             Validation
-                 ↓
-             Compilation
-                 ↓
-              CP-SAT
-        """
-
-        constraint = self.generate_and_validate(
-            db=db,
-            user_text=user_text,
-        )
-
+        constraint = self.generate_and_validate(db=db, user_text=user_text)
         penalties = self.compile(
             model=model,
             assign=assign,
             constraint=constraint,
             data=data,
         )
-
         return constraint, penalties
